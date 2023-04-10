@@ -1,64 +1,58 @@
-package main
+package parse
 
 import (
 	"context"
 	"fmt"
 	"io/ioutil"
 	"log"
-	"os"
 	"os/exec"
-	"path"
 	"strconv"
 	"strings"
 
-	"github.com/robotsail/go-create-test/pkg/cmd"
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
+
+	"github.com/robotsail/go-create-test/pkg/types"
 )
 
-var testGoFile = path.Join("example", "test.go")
-
-// LoadTestFile reads in the test file and returns the contents as a string
-func LoadTestFile() ([]byte, error) {
-	// load the test file from testGoFile
-	data, err := ioutil.ReadFile(testGoFile)
-	if err != nil {
-		return nil, err
+//	func FindFunction(functionName string, node *sitter.Node, source []byte) *sitter.Node {
+//		log.Printf("looking for function %q", functionName)
+//		if node.Type() != "function_declaration" {
+//			log.Println("not a function declaration, recursing")
+//			funcNode := FindFunction(functionName, node.Child(0), source)
+//			if funcNode != nil {
+//				return funcNode
+//			}
+//			return FindFunction(functionName, node.NextSibling(), source)
+//		}
+//		// find name child
+//		name := node.ChildByFieldName("name")
+//		if name == nil || name.Content(source) != functionName {
+//			return nil
+//		}
+//		return node
+//	}
+func FindFunction(functionName string, t *sitter.Node, source []byte) *sitter.Node {
+	if t.Type() == "function_declaration" {
+		nameNode := t.ChildByFieldName("name")
+		if nameNode == nil {
+			return nil
+		}
+		if NodeName(nameNode, source) == functionName {
+			return t
+		}
 	}
-	return data, nil
-}
-
-type FunctionDeclaration struct {
-	Name string
-	Body string
-}
-
-type FunctionCall struct {
-	Name     string
-	Location sitter.Point
-}
-
-func main() {
-	// fileContents, err := LoadTestFile()
-	// if err != nil {
-	// 	fmt.Println(err)
-	// 	os.Exit(1)
-	// }
-	// err = parseCode(fileContents)
-	// if err != nil {
-	// 	fmt.Printf("Error parsing source code: %v", err)
-	// 	os.Exit(1)
-	// }
-	rootCmd := cmd.NewGenerateTestCmd()
-	if err := rootCmd.Execute(); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	} else {
-		os.Exit(0)
+	for i := 0; i < int(t.ChildCount()); i++ {
+		childNode := t.Child(i)
+		funcNode := FindFunction(functionName, childNode, source)
+		if funcNode != nil {
+			return funcNode
+		}
 	}
+	return nil
 }
 
-func parseCode(code []byte) error {
+func ParseCode(filepath string, functionName string, code []byte) error {
 	log.Println("parsing code")
 	parser := sitter.NewParser()
 	parser.SetLanguage(golang.GetLanguage())
@@ -67,17 +61,24 @@ func parseCode(code []byte) error {
 	if err != nil {
 		return err
 	}
-	functions := extractFunctions(tree.RootNode(), code)
+
+	log.Println("looking for function")
+	targetFunction := FindFunction(functionName, tree.RootNode(), code)
+	if targetFunction == nil {
+		return fmt.Errorf("could not find function %q", functionName)
+	}
+
+	functions := ExtractFunctions(tree.RootNode(), code)
 	for _, function := range functions {
 		fmt.Printf("Found function '%s', definition:\n%s\n\n", function.Name, function.Body)
 	}
 
-	functionCalls := findFunctionCalls(tree.RootNode(), code)
+	functionCalls := FindFunctionCalls(targetFunction, code)
 	for _, call := range functionCalls {
-		fmt.Printf("Found function call '%s' at '%d:%d'\n", nodeName(call, code), call.StartPoint().Row, call.StartPoint().Column)
+		fmt.Printf("Found function call '%s' at '%d:%d'\n", NodeName(call, code), call.StartPoint().Row, call.StartPoint().Column)
 	}
 
-	defs, err := findDefinitions(functionCalls, code)
+	defs, err := FindDefinitions(filepath, functionCalls, code)
 	if err != nil {
 		return fmt.Errorf("error finding definitions: %v", err)
 	}
@@ -93,27 +94,31 @@ func parseCode(code []byte) error {
 	return nil
 }
 
-func extractFunctions(t *sitter.Node, source []byte) []FunctionDeclaration {
-	functions := []FunctionDeclaration{}
+func ExtractFunctions(t *sitter.Node, source []byte) []types.FunctionDeclaration {
+	functions := []types.FunctionDeclaration{}
 	if t.Type() == "function_declaration" {
-		functions = append(functions, FunctionDeclaration{
+		nameNode := t.ChildByFieldName("name")
+		if nameNode == nil {
+			return functions
+		}
+		functions = append(functions, types.FunctionDeclaration{
 			Body: string(t.Content([]byte(source))),
-			Name: string(t.Child(1).Content([]byte(source))),
+			Name: string(nameNode.Content([]byte(source))),
 		},
 		)
 	}
 	for i := 0; i < int(t.ChildCount()); i++ {
 		childNode := t.Child(i)
-		functions = append(functions, extractFunctions(childNode, source)...)
+		functions = append(functions, ExtractFunctions(childNode, source)...)
 	}
 	return functions
 }
 
-func nodeName(t *sitter.Node, source []byte) string {
+func NodeName(t *sitter.Node, source []byte) string {
 	return string(t.Content([]byte(source)))
 }
 
-func functionDefinitionFromSelector(t *sitter.Node, source []byte) *sitter.Node {
+func FunctionDefinitionFromSelector(t *sitter.Node, source []byte) *sitter.Node {
 	if t.Type() != "selector_expression" {
 		return nil
 	}
@@ -126,26 +131,26 @@ func functionDefinitionFromSelector(t *sitter.Node, source []byte) *sitter.Node 
 	return nil
 }
 
-func getFunctionLocation(t *sitter.Node, source []byte) *sitter.Node {
+func GetFunctionLocation(t *sitter.Node, source []byte) *sitter.Node {
 	fmt.Printf("checking function, type is %s\n", t.Type())
 	if t.Type() == "identifier" {
-		fmt.Printf("Found function '%s' at '%d:%d'\n", nodeName(t, source), t.StartPoint().Row, t.StartPoint().Column)
+		fmt.Printf("Found function '%s' at '%d:%d'\n", NodeName(t, source), t.StartPoint().Row, t.StartPoint().Column)
 		return t
 	}
 	if t.Type() == "selector_expression" {
-		funcDef := functionDefinitionFromSelector(t, source)
-		fmt.Printf("function '%s' of '%s' is located at '%d:%d'\n", nodeName(funcDef, source), nodeName(t, source), funcDef.StartPoint().Row, funcDef.StartPoint().Column)
+		funcDef := FunctionDefinitionFromSelector(t, source)
+		fmt.Printf("function '%s' of '%s' is located at '%d:%d'\n", NodeName(funcDef, source), NodeName(t, source), funcDef.StartPoint().Row, funcDef.StartPoint().Column)
 		return funcDef
 	}
 	return nil
 }
 
-// findFunctionCalls Returns a list of function calls in the source code
-func findFunctionCalls(t *sitter.Node, source []byte) []*sitter.Node {
+// FindFunctionCalls Returns a list of function calls in the source code
+func FindFunctionCalls(t *sitter.Node, source []byte) []*sitter.Node {
 	calls := []*sitter.Node{}
 	if t.Type() == "call_expression" {
 		child := t.Child(0)
-		location := getFunctionLocation(child, source)
+		location := GetFunctionLocation(child, source)
 		if location == nil {
 			return nil
 		}
@@ -153,7 +158,7 @@ func findFunctionCalls(t *sitter.Node, source []byte) []*sitter.Node {
 	}
 	for i := 0; i < int(t.ChildCount()); i++ {
 		childNode := t.Child(i)
-		functionCalls := findFunctionCalls(childNode, source)
+		functionCalls := FindFunctionCalls(childNode, source)
 		if len(functionCalls) > 0 {
 			calls = append(calls, functionCalls...)
 		}
@@ -161,17 +166,11 @@ func findFunctionCalls(t *sitter.Node, source []byte) []*sitter.Node {
 	return calls
 }
 
-type DefinitionLocation struct {
-	Filepath string
-	Start    sitter.Point
-	End      sitter.Point
-}
-
-// definitionStringFromGopls accepts the output from a gopls definition command
+// DefinitionStringFromGopls accepts the output from a gopls definition command
 // and returns only the file path and line number
 // e.g. "'/Users/osilkin/Programming/playground/go-create-test/example/test.go:8:6-14: defined here as func fortnite() string"
 // becomes "/Users/osilkin/Programming/playground/go-create-test/example/test.go:8:6-14"
-func definitionStringFromGopls(definition string) (string, sitter.Point, error) {
+func DefinitionStringFromGopls(definition string) (string, sitter.Point, error) {
 	def := strings.Split(definition, " ")
 	// remove end ':' from the file path
 	symbolPath := def[0]
@@ -200,15 +199,15 @@ func definitionStringFromGopls(definition string) (string, sitter.Point, error) 
 	return filepath, startPoint, nil
 }
 
-func findDefinitions(calls []*sitter.Node, code []byte) ([]DefinitionLocation, error) {
-	definitions := []DefinitionLocation{}
+func FindDefinitions(filename string, calls []*sitter.Node, code []byte) ([]types.DefinitionLocation, error) {
+	definitions := []types.DefinitionLocation{}
 	for _, call := range calls {
-		params := fmt.Sprintf("%s:%d:%d", testGoFile, call.StartPoint().Row+1, call.StartPoint().Column+1)
+		params := fmt.Sprintf("%s:%d:%d", filename, call.StartPoint().Row+1, call.StartPoint().Column+1)
 		out, err := exec.Command("gopls", "definition", params).Output()
 		if err != nil {
 			return nil, fmt.Errorf("error running gopls definition: %v", err)
 		}
-		filepath, location, err := definitionStringFromGopls(string(out))
+		filepath, location, err := DefinitionStringFromGopls(string(out))
 		if err != nil {
 			return nil, fmt.Errorf("error parsing gopls definition: %v", err)
 		}
@@ -216,19 +215,14 @@ func findDefinitions(calls []*sitter.Node, code []byte) ([]DefinitionLocation, e
 		if err != nil {
 			return nil, fmt.Errorf("error getting definition range: %v", err)
 		}
-		fmt.Printf("definition range for '%s' is '%+v'\n", nodeName(call, code), definitionRange)
-		definitions = append(definitions, DefinitionLocation{
+		fmt.Printf("definition range for '%s' is '%+v'\n", NodeName(call, code), definitionRange)
+		definitions = append(definitions, types.DefinitionLocation{
 			Filepath: filepath,
 			Start:    definitionRange.Start,
 			End:      definitionRange.End,
 		})
 	}
 	return definitions, nil
-}
-
-type FunctionLocation struct {
-	FilePath string
-	Point    sitter.Point
 }
 
 // // Returns a struct containing information encoded in the location string.
@@ -266,37 +260,32 @@ type FunctionLocation struct {
 // 	}, nil
 // }
 
-type Range struct {
-	Start sitter.Point
-	End   sitter.Point
-}
-
-// getSplitRange takes a range string like 'row:col-row:col' and returns it in a serialized format.
-func getSplitRange(rangeString string) (Range, error) {
+// GetSplitRange takes a range string like 'row:col-row:col' and returns it in a serialized format.
+func GetSplitRange(rangeString string) (types.Range, error) {
 	// validate that string matches row:col-row:col
 	if !strings.Contains(rangeString, "-") {
-		return Range{}, fmt.Errorf("invalid range string: %s", rangeString)
+		return types.Range{}, fmt.Errorf("invalid range string: %s", rangeString)
 	}
 	splitRange := strings.Split(rangeString, "-")
 	start := strings.Split(splitRange[0], ":")
 	end := strings.Split(splitRange[1], ":")
 	startRow, err := strconv.ParseUint(start[0], 10, 32)
 	if err != nil {
-		return Range{}, fmt.Errorf("invalid start row: %s", start[0])
+		return types.Range{}, fmt.Errorf("invalid start row: %s", start[0])
 	}
 	startCol, err := strconv.ParseUint(start[1], 10, 32)
 	if err != nil {
-		return Range{}, fmt.Errorf("invalid start column: %s", start[1])
+		return types.Range{}, fmt.Errorf("invalid start column: %s", start[1])
 	}
 	endRow, err := strconv.ParseUint(end[0], 10, 32)
 	if err != nil {
-		return Range{}, fmt.Errorf("invalid end row: %s", end[0])
+		return types.Range{}, fmt.Errorf("invalid end row: %s", end[0])
 	}
 	endCol, err := strconv.ParseUint(end[1], 10, 32)
 	if err != nil {
-		return Range{}, fmt.Errorf("invalid end column: %s", end[1])
+		return types.Range{}, fmt.Errorf("invalid end column: %s", end[1])
 	}
-	return Range{
+	return types.Range{
 		Start: sitter.Point{
 			Row:    uint32(startRow),
 			Column: uint32(startCol),
@@ -311,20 +300,20 @@ func getSplitRange(rangeString string) (Range, error) {
 // GetDefinitionRange finds the function definition range.
 //
 //	string - the range where the function is defined on
-func GetDefinitionRange(filepath string, location sitter.Point) (Range, error) {
+func GetDefinitionRange(filepath string, location sitter.Point) (types.Range, error) {
 	foldingRangeCmd := exec.Command("gopls", "folding_ranges", filepath)
 	foldingRangeBytes, err := foldingRangeCmd.Output()
 	if err != nil {
-		return Range{}, fmt.Errorf("error running gopls folding_ranges: %w", err)
+		return types.Range{}, fmt.Errorf("error running gopls folding_ranges: %w", err)
 	}
 	foldingRange := string(foldingRangeBytes)
 	foldingRange = strings.TrimSpace(foldingRange)
 	foldingRanges := strings.Split(foldingRange, "\n")
 
 	// convert to ranges
-	ranges := []Range{}
+	ranges := []types.Range{}
 	for _, rangeLine := range foldingRanges {
-		symbolRange, err := getSplitRange(rangeLine)
+		symbolRange, err := GetSplitRange(rangeLine)
 		if err != nil {
 			fmt.Printf("could not parse range: %v\n", err)
 			continue
@@ -333,7 +322,7 @@ func GetDefinitionRange(filepath string, location sitter.Point) (Range, error) {
 	}
 
 	// collect only the matching ranges
-	biggestRange := Range{}
+	biggestRange := types.Range{}
 	for i := 0; i < len(ranges); i++ {
 		if ranges[i].Start.Row == location.Row && ranges[i].End.Row > biggestRange.End.Row {
 			biggestRange = ranges[i]
@@ -357,7 +346,7 @@ func GetFunctionComments(fileLines []string, start int) (comments []string) {
 	return
 }
 
-func ReadFunctionDefinitions(defs []DefinitionLocation) ([]string, error) {
+func ReadFunctionDefinitions(defs []types.DefinitionLocation) ([]string, error) {
 	contents := []string{}
 	for _, def := range defs {
 		// read in the given filepath and get the function definition
