@@ -29,3 +29,9 @@ type Range struct {
 	Start sitter.Point
 	End   sitter.Point
 }
+
+type TestCodePrompt struct {
+	TargetFunction  string
+	CalledFunctions []string
+	PackageName     string
+}

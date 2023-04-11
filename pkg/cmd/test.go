@@ -4,7 +4,9 @@ import (
 	"io/ioutil"
 	"log"
 
+	"github.com/robotsail/go-create-test/pkg/lib"
 	"github.com/robotsail/go-create-test/pkg/parse"
+	"github.com/robotsail/go-create-test/pkg/types"
 	"github.com/spf13/cobra"
 )
 
@@ -54,6 +56,27 @@ func RunGenerateTests(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	parse.ParseCode(opts.Filepath, opts.FunctionName, code)
-	return nil
+	packageName, err := parse.GetPackageName(code)
+	if err != nil {
+		return err
+	}
+	log.Printf("packageName: %q\n", packageName)
+
+	targetFunctionDef, err := parse.GetFunctionDefinition(opts.FunctionName, code)
+	if err != nil {
+		return err
+	}
+
+	functionDefs, err := parse.GetFunctionCalls(opts.Filepath, opts.FunctionName, code)
+	if err != nil {
+		return err
+	}
+
+	testFile, err := lib.GenerateTestCode(types.TestCodePrompt{
+		TargetFunction:  targetFunctionDef,
+		CalledFunctions: functionDefs,
+		PackageName:     packageName,
+	})
+	log.Printf("testFile:\n---------\n%s\n---------\n", testFile)
+	return err
 }
