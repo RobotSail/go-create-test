@@ -3,7 +3,6 @@ package lib
 import (
 	"context"
 	"fmt"
-	"log"
 	"os"
 	"strings"
 	"text/template"
@@ -12,7 +11,10 @@ import (
 	openai "github.com/sashabaranov/go-openai"
 )
 
-const systemPrompt = `You are a highly skilled golang developer who has spent years writing test code at Google. You are helping a new developer write a test for a function.`
+const systemPrompt = `You are a highly skilled machine that writes Golang tests for a living.
+You process requests to write test code for a given function and are provided with all of the definitions that the target function calls.
+Given a request to test a function, respond only with the code for the entire test file.
+`
 
 const prompt = `
 You must write a Golang test for the following function:
@@ -32,8 +34,6 @@ to properly test for any edge cases or fail points.
 {{.CalledFunctions}}
 ` + "```" + `
 
-Given the above information, write a Go test file for the target function in package '{{.PackageName}}_test'. Please use the built-in testing package.
-Only return the code.
 `
 
 func createTestPrompt(params types.TestCodePrompt) (string, error) {
@@ -55,9 +55,9 @@ func GenerateTestCode(params types.TestCodePrompt) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("failed to create prompt: %w", err)
 	}
-	log.Printf("system prompt:\n-------\n%s\n------\nuser message:\n-------\n%s\n-------\n", systemPrompt, prompt)
 	apiKey := os.Getenv("OPENAI_API_KEY")
 	client := openai.NewClient(apiKey)
+
 	res, err := client.CreateChatCompletion(context.Background(), openai.ChatCompletionRequest{
 		Model: openai.GPT4,
 		Messages: []openai.ChatCompletionMessage{
@@ -82,4 +82,16 @@ func GenerateTestCode(params types.TestCodePrompt) (string, error) {
 	}
 	generation := res.Choices[0]
 	return generation.Message.Content, nil
+}
+
+// UnwrapResponse accepts a piece of code which is enclosed within two backtick blocks, like '```\nfoo\n```'.
+func UnwrapResponse(response string) string {
+	// check if the response is wrapped in backticks
+	if !strings.HasPrefix(response, "```go") && !strings.HasSuffix(response, "```") {
+		return response
+	}
+
+	unwrapped := strings.TrimPrefix(response, "```go")
+	unwrapped = strings.TrimSuffix(unwrapped, "```")
+	return unwrapped
 }

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/schollz/progressbar/v3"
 	sitter "github.com/smacker/go-tree-sitter"
 	"github.com/smacker/go-tree-sitter/golang"
 
@@ -17,37 +18,61 @@ import (
 
 const queryPattern = `
 (
-  (comment) @function.comment
+  (comment)? @function.comment
   (function_declaration
     name: (identifier) @function.name
-    body: (block) @function.body)
+    body: (block)
+	) @function.definition
 )
 `
 
+const methodQuery = `
+(
+	((comment) @comment)
+	(method_declaration
+  		name: (field_identifier) @method-name
+  		body: (block) 
+	) @method-declaration
+)
+`
+
+const callExpressionQuerySelector = `(call_expression function: (selector_expression field: (field_identifier) @fieldname) @function)`
+const callExpressionQueryIdentifier = `(call_expression function: (identifier) @name)`
+const queryFunctionNode = `(function_declaration name: (identifier) @function.name) @function`
+
 // findFunction attempts to find a function with the target name in the given source tree.
 // The root declaration node is returned.
-func findFunction(functionName string, t *sitter.Node, source []byte) *sitter.Node {
-	if t == nil {
-		return nil
+func findFunction(functionName string, t *sitter.Node, source []byte) (*sitter.Node, error) {
+	// create a tree-sitter parser
+	log.Printf("searching for function %q\n", functionName)
+
+	// create a query to extract the golang package name from the code
+	query, err := sitter.NewQuery([]byte(queryFunctionNode), golang.GetLanguage())
+	if err != nil {
+		return nil, fmt.Errorf("could not create query: %w", err)
 	}
-	if t.Type() == "function_declaration" {
-		nameNode := t.ChildByFieldName("name")
-		if nameNode == nil {
-			return nil
+
+	queryCursor := sitter.NewQueryCursor()
+	defer queryCursor.Close()
+
+	tempPtr := t
+	queryCursor.Exec(query, tempPtr)
+
+	// var startByte, endByte uint32
+	var capturedNode *sitter.Node
+	for {
+		match, ok := queryCursor.NextMatch()
+		if !ok {
+			break
 		}
-		if nodeName(nameNode, source) == functionName {
-			return t
+		function := match.Captures[0]
+		funcName := match.Captures[1]
+		if funcName.Node.Content(source) == functionName {
+			capturedNode = function.Node
+			break
 		}
 	}
-	for i := 0; i < int(t.ChildCount()); i++ {
-		childNode := t.Child(i)
-		funcNode := findFunction(functionName, childNode, source)
-		if funcNode != nil {
-			return funcNode
-		}
-	}
-	// move onto next sibling
-	return findFunction(functionName, t.NextSibling(), source)
+	return capturedNode, nil
 }
 
 // GetFunctionCalls takes a given function name and file to look at, then
@@ -69,20 +94,32 @@ func GetFunctionCalls(filepath string, functionName string, code []byte) ([]stri
 	}
 	defer tree.Close()
 
-	targetFunction := findFunction(functionName, tree.RootNode(), code)
+	targetFunction, err := findFunction(functionName, tree.RootNode(), code)
+	if err != nil {
+		return nil, fmt.Errorf("could not find function %q: %w", functionName, err)
+	}
 	if targetFunction == nil {
 		return nil, fmt.Errorf("could not find function %q", functionName)
 	}
 
-	functionCalls := findFunctionCalls(targetFunction, code)
-	for _, call := range functionCalls {
-		log.Printf("Found function call '%s' at '%d:%d'\n", nodeName(call, code), call.StartPoint().Row, call.StartPoint().Column)
+	log.Println("scanning for function calls")
+
+	functionCalls, err := findFunctionCalls(targetFunction, code)
+	if err != nil {
+		return nil, fmt.Errorf("could not find function calls: %w", err)
+	}
+	if functionCalls == nil {
+		return nil, fmt.Errorf("could not find function calls")
+	}
+	for call, funcNode := range functionCalls {
+		log.Printf("Found function call '%s' at '%d:%d'\n", call, funcNode.Ref.StartPoint().Row, funcNode.Ref.StartPoint().Column)
 	}
 
 	functionDefs, err := findDefinitions(filepath, functionCalls, code)
 	if err != nil {
 		return nil, fmt.Errorf("error finding definitions: %v", err)
 	}
+
 	defs, err := readFunctionDefinitions(functionDefs)
 	if err != nil {
 		return nil, fmt.Errorf("error reading function definitions: %v", err)
@@ -125,25 +162,127 @@ func getFunctionLocation(t *sitter.Node, source []byte) *sitter.Node {
 	return nil
 }
 
+type FunctionCallRef struct {
+	Name     string
+	Ref      *sitter.Node
+	Filepath string
+}
+
+func findDirectFunctionCalls(t *sitter.Node, source []byte) (map[string]FunctionCallRef, error) {
+	// create a tree-sitter parser
+	functionName := t.ChildByFieldName("name")
+	if functionName == nil {
+		return nil, fmt.Errorf("could not find function name")
+	}
+
+	// create a query to extract the golang package name from the code
+	query, err := sitter.NewQuery([]byte(callExpressionQueryIdentifier), golang.GetLanguage())
+	if err != nil {
+		return nil, fmt.Errorf("could not create query: %w", err)
+	}
+
+	queryCursor := sitter.NewQueryCursor()
+	defer queryCursor.Close()
+
+	tempPtr := t
+	queryCursor.Exec(query, tempPtr)
+	defer queryCursor.Close()
+	calls := map[string]FunctionCallRef{}
+
+	// var startByte, endByte uint32
+	for {
+		match, ok := queryCursor.NextMatch()
+		if !ok {
+			break
+		}
+		if len(match.Captures) == 0 {
+			fmt.Println("no captures, skipping")
+			continue
+		}
+		functionCallNode := match.Captures[0].Node
+		functionCall := FunctionCallRef{
+			Name: nodeName(functionCallNode, source),
+			Ref:  functionCallNode,
+		}
+		// check if function call already exists in calls
+		if _, ok := calls[functionCall.Name]; ok {
+			continue
+		}
+		calls[functionCall.Name] = functionCall
+	}
+	return calls, nil
+}
+
+func callFromQuery(match *sitter.QueryMatch, code []byte) (name string, field *sitter.Node) {
+	for _, capture := range match.Captures {
+		node := capture.Node
+		switch node.Type() {
+		case "selector_expression":
+			name = node.Content(code)
+		case "field_identifier":
+			field = node
+		default:
+			log.Printf("unknown node type %s", node.Type())
+			break
+		}
+	}
+	return
+}
+
+func findSelectExpressionCalls(t *sitter.Node, source []byte) (map[string]FunctionCallRef, error) {
+	// create a tree-sitter parser
+	functionName := t.ChildByFieldName("name")
+	if functionName == nil {
+		return nil, fmt.Errorf("could not find function name")
+	}
+
+	// create a query to extract the golang package name from the code
+	query, err := sitter.NewQuery([]byte(callExpressionQuerySelector), golang.GetLanguage())
+	if err != nil {
+		return nil, fmt.Errorf("could not create query: %w", err)
+	}
+
+	queryCursor := sitter.NewQueryCursor()
+	defer queryCursor.Close()
+
+	tempPtr := t
+	queryCursor.Exec(query, tempPtr)
+	defer queryCursor.Close()
+	calls := map[string]FunctionCallRef{}
+
+	// var startByte, endByte uint32
+	for {
+		match, ok := queryCursor.NextMatch()
+		if !ok {
+			break
+		}
+		name, field := callFromQuery(match, source)
+		if _, ok := calls[name]; ok {
+			continue
+		}
+		calls[name] = FunctionCallRef{
+			Name: name,
+			Ref:  field,
+		}
+	}
+	return calls, nil
+
+}
+
 // findFunctionCalls Returns a list of function calls in the source code
-func findFunctionCalls(t *sitter.Node, source []byte) []*sitter.Node {
-	calls := []*sitter.Node{}
-	if t.Type() == "call_expression" {
-		child := t.Child(0)
-		location := getFunctionLocation(child, source)
-		if location == nil {
-			return nil
-		}
-		calls = append(calls, location)
+func findFunctionCalls(t *sitter.Node, source []byte) (map[string]FunctionCallRef, error) {
+	calls, err := findDirectFunctionCalls(t, source)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get direct function calls: %w", err)
 	}
-	for i := 0; i < int(t.ChildCount()); i++ {
-		childNode := t.Child(i)
-		functionCalls := findFunctionCalls(childNode, source)
-		if len(functionCalls) > 0 {
-			calls = append(calls, functionCalls...)
-		}
+	selectCalls, err := findSelectExpressionCalls(t, source)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get select expression calls: %w", err)
 	}
-	return calls
+	for k, v := range selectCalls {
+		calls[k] = v
+	}
+	return calls, nil
 }
 
 // DefinitionStringFromGopls accepts the output from a gopls definition command
@@ -179,10 +318,12 @@ func DefinitionStringFromGopls(definition string) (string, sitter.Point, error) 
 	return filepath, startPoint, nil
 }
 
-func findDefinitions(filename string, calls []*sitter.Node, code []byte) ([]types.DefinitionLocation, error) {
+func findDefinitions(filename string, calls map[string]FunctionCallRef, code []byte) ([]types.DefinitionLocation, error) {
 	definitions := []types.DefinitionLocation{}
+	fileSize := len(calls)
+	bar := progressbar.Default(int64(fileSize))
 	for _, call := range calls {
-		params := fmt.Sprintf("%s:%d:%d", filename, call.StartPoint().Row+1, call.StartPoint().Column+1)
+		params := fmt.Sprintf("%s:%d:%d", filename, call.Ref.StartPoint().Row+1, call.Ref.StartPoint().Column+1)
 		command := exec.Command("gopls", "definition", params)
 		out, err := command.Output()
 		if err != nil {
@@ -193,20 +334,22 @@ func findDefinitions(filename string, calls []*sitter.Node, code []byte) ([]type
 			}
 			return nil, fmt.Errorf("error running gopls definition: %w", err)
 		}
-		filepath, location, err := DefinitionStringFromGopls(string(out))
+		filepath, _, err := DefinitionStringFromGopls(string(out))
 		if err != nil {
 			return nil, fmt.Errorf("error parsing gopls definition: %w", err)
 		}
-		definitionRange, err := getDefinitionRange(filepath, location)
+		// definitionRange, err := getDefinitionRange(filepath, location)
 		if err != nil {
 			return nil, fmt.Errorf("error getting definition range: %w", err)
 		}
-		log.Printf("definition range for '%s' is '%+v'\n", nodeName(call, code), definitionRange)
+		// log.Printf("definition range for '%s' is '%+v'\n", nodeName(call, code), definitionRange)
 		definitions = append(definitions, types.DefinitionLocation{
-			Filepath: filepath,
-			Start:    definitionRange.Start,
-			End:      definitionRange.End,
+			Filepath:     filepath,
+			FunctionName: call.Name,
+			// Start:    definitionRange.Start,
+			// End:      definitionRange.End,
 		})
+		bar.Add(1)
 	}
 	return definitions, nil
 }
@@ -306,26 +449,66 @@ func readFunctionDefinitions(defs []types.DefinitionLocation) ([]string, error) 
 			return nil, fmt.Errorf("could not open file: %w", err)
 		}
 		// extract the content at the range specified
-		fileStr := string(file)
-		fileLines := strings.Split(fileStr, "\n")
-		if len(fileLines) < int(def.End.Row) {
-			return nil, fmt.Errorf("file does not have enough lines: %s", def.Filepath)
+		searchName := def.FunctionName
+		if strings.Contains(searchName, ".") {
+			parts := strings.Split(searchName, ".")
+			funcName := parts[1]
+			searchName = funcName
 		}
-		functionBody := fileLines[def.Start.Row-1 : def.End.Row]
-		// include the comments
-		startIndex := int(def.Start.Row)
-		commentLines := getFunctionComments(fileLines, startIndex-2)
-		functionDef := append(commentLines, functionBody...)
-		function := strings.Join(functionDef, "\n")
-		contents = append(contents, function)
+		functionDef, err := GetFunctionDefinition(searchName, file)
+		if err != nil {
+			fmt.Println("could not find function definition, skipping")
+			continue
+		}
+		if strings.TrimSpace(functionDef) == "" {
+			log.Printf("could not find function definition for %q\n", def.FunctionName)
+		}
+		contents = append(contents, functionDef)
 	}
 	return contents, nil
 }
 
+type FunctionDefinition struct {
+	Declaration string
+	Comment     string
+	Name        string
+}
+
+func functionFromQuery(match *sitter.QueryMatch, code []byte) FunctionDefinition {
+	function := FunctionDefinition{}
+	for _, capture := range match.Captures {
+		node := capture.Node
+		switch node.Type() {
+		case "function_declaration":
+			function.Declaration = node.Content(code)
+		case "comment":
+			function.Comment = node.Content(code)
+		case "identifier":
+			function.Name = node.Content(code)
+		}
+	}
+	return function
+}
+
+func methodFunctionFromQuery(match *sitter.QueryMatch, code []byte) FunctionDefinition {
+	function := FunctionDefinition{}
+	for _, capture := range match.Captures {
+		node := capture.Node
+		switch node.Type() {
+		case "comment":
+			function.Comment = node.Content(code)
+		case "field_identifier":
+			function.Name = node.Content(code)
+		case "method_declaration":
+			function.Declaration = node.Content(code)
+		}
+	}
+	return function
+}
+
 // GetFunctionDefinition Returns the definition of a given function within a given file.
-func GetFunctionDefinition(functionName string, code []byte) (string, error) {
+func GetFunctionDefinition(targetFuncName string, code []byte) (string, error) {
 	// create a tree-sitter parser
-	log.Println("getting function definition")
 	parser := sitter.NewParser()
 	parser.SetLanguage(golang.GetLanguage())
 
@@ -341,30 +524,73 @@ func GetFunctionDefinition(functionName string, code []byte) (string, error) {
 	}
 	defer tree.Close()
 
+	root := tree.RootNode()
+	targetFunc := getFunctionDefinitionQuery(targetFuncName, root, code)
+	if targetFunc == nil {
+		targetFunc = getMethodDefinitionQuery(targetFuncName, root, code)
+	}
+	if targetFunc == nil {
+		return "", fmt.Errorf("could not find function definition for %q", targetFuncName)
+	}
+
+	return reconstructionDefinition(*targetFunc), nil
+}
+
+func getFunctionDefinitionQuery(targetFuncName string, root *sitter.Node, code []byte) *FunctionDefinition {
 	query, err := sitter.NewQuery([]byte(queryPattern), golang.GetLanguage())
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	root := tree.RootNode()
 	queryCursor := sitter.NewQueryCursor()
 	defer queryCursor.Close()
 	queryCursor.Exec(query, root)
 
-	var startByte, endByte uint32
+	var targetFunc *FunctionDefinition
 	for {
 		match, ok := queryCursor.NextMatch()
 		if !ok {
 			break
 		}
-		for _, capture := range match.Captures {
-			if capture.Index == 0 {
-				startByte = capture.Node.StartByte()
-			}
-			endByte = capture.Node.EndByte()
+		function := functionFromQuery(match, code)
+		if function.Name == targetFuncName {
+			targetFunc = &function
+			break
 		}
 	}
-	return string(code[startByte:endByte]), nil
+	return targetFunc
+}
+
+func getMethodDefinitionQuery(targetFuncName string, root *sitter.Node, code []byte) *FunctionDefinition {
+	query, err := sitter.NewQuery([]byte(methodQuery), golang.GetLanguage())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	queryCursor := sitter.NewQueryCursor()
+	defer queryCursor.Close()
+	queryCursor.Exec(query, root)
+
+	var targetFunc *FunctionDefinition
+	for {
+		match, ok := queryCursor.NextMatch()
+		if !ok {
+			break
+		}
+		function := methodFunctionFromQuery(match, code)
+		if function.Name == targetFuncName {
+			targetFunc = &function
+			break
+		}
+	}
+	return targetFunc
+}
+
+func reconstructionDefinition(function FunctionDefinition) string {
+	if strings.TrimSpace(function.Comment) == "" {
+		return function.Declaration
+	}
+	return fmt.Sprintf("%s\n%s", function.Comment, function.Declaration)
 }
 
 // GetPackageName Queries the given file for the package name.

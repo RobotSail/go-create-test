@@ -15,9 +15,10 @@ type FunctionCall struct {
 }
 
 type DefinitionLocation struct {
-	Filepath string
-	Start    sitter.Point
-	End      sitter.Point
+	Filepath     string
+	FunctionName string
+	Start        sitter.Point
+	End          sitter.Point
 }
 
 type FunctionLocation struct {
